@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import secrets
 
 import modal_rbe  # noqa: F401  (side-effecting: registers proto path)
 
 import grpc
 import grpc.aio
+import modal
 from build.bazel.remote.execution.v2 import remote_execution_pb2_grpc as rex_grpc
 from google.bytestream import bytestream_pb2_grpc as bs_grpc
 
-from .app import app
+from .app import app, cache_image
 from . import cas as _cas  # noqa: F401  (registers _volume_* Functions)
 from . import execute as _execute  # noqa: F401  (registers execute_action)
 from .servicers.ac_servicer import ActionCacheServicer
@@ -30,13 +33,71 @@ DEFAULT_MAX_BLOB_SIZE = 4 * 1024 * 1024 * 1024
 DEFAULT_MAX_BATCH_SIZE = 4 * 1024 * 1024
 
 
+async def _abort_unauthenticated(context: grpc.aio.ServicerContext) -> None:
+    await context.abort(grpc.StatusCode.UNAUTHENTICATED, "missing or invalid auth token")
+
+
+async def _deny_uu(request, context):
+    await _abort_unauthenticated(context)
+
+
+async def _deny_us(request, context):  # unary_stream — must be a generator
+    await _abort_unauthenticated(context)
+    yield  # pragma: no cover  (unreachable)
+
+
+async def _deny_su(request_iter, context):
+    await _abort_unauthenticated(context)
+
+
+async def _deny_ss(request_iter, context):
+    await _abort_unauthenticated(context)
+    yield  # pragma: no cover
+
+
+def _build_deny_handler(orig: grpc.RpcMethodHandler) -> grpc.RpcMethodHandler:
+    """Replace a handler with one that immediately aborts UNAUTHENTICATED.
+
+    The replacement keeps the same RPC type (unary/stream) so gRPC's dispatch
+    machinery doesn't trip; the abort fires before any request bytes are
+    deserialized.
+    """
+    rd = orig.request_deserializer
+    rs = orig.response_serializer
+    if orig.unary_unary:
+        return grpc.unary_unary_rpc_method_handler(_deny_uu, rd, rs)
+    if orig.unary_stream:
+        return grpc.unary_stream_rpc_method_handler(_deny_us, rd, rs)
+    if orig.stream_unary:
+        return grpc.stream_unary_rpc_method_handler(_deny_su, rd, rs)
+    return grpc.stream_stream_rpc_method_handler(_deny_ss, rd, rs)
+
+
+class _BearerAuthInterceptor(grpc.aio.ServerInterceptor):
+    """Reject any RPC whose `authorization` metadata isn't `Bearer <token>`."""
+
+    def __init__(self, token: str) -> None:
+        self._expected = f"Bearer {token}"
+
+    async def intercept_service(self, continuation, handler_call_details):
+        for k, v in handler_call_details.invocation_metadata or ():
+            if k.lower() == "authorization" and v == self._expected:
+                return await continuation(handler_call_details)
+        original = await continuation(handler_call_details)
+        return _build_deny_handler(original)
+
+
 def _build_server(
     port: int,
     exec_enabled: bool,
     max_blob_size: int,
     max_batch_size: int,
+    auth_token: str | None = None,
 ) -> grpc.aio.Server:
-    server = grpc.aio.server()
+    interceptors = []
+    if auth_token:
+        interceptors.append(_BearerAuthInterceptor(auth_token))
+    server = grpc.aio.server(interceptors=interceptors) if interceptors else grpc.aio.server()
     rex_grpc.add_CapabilitiesServicer_to_server(
         CapabilitiesServicer(
             exec_enabled=exec_enabled, max_batch_size=max_batch_size
@@ -102,6 +163,7 @@ def serve(
     max_blob_size: int = DEFAULT_MAX_BLOB_SIZE,
     max_batch_size: int = DEFAULT_MAX_BATCH_SIZE,
 ):
+    """Run the gRPC server locally; clients use grpc://localhost:50051."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -117,3 +179,79 @@ def serve(
         )
     except KeyboardInterrupt:
         pass
+
+
+# ---------------------------------------------------------------------------
+# In-cluster server: runs the gRPC server inside a Modal container so that
+# every Dict / Volume / Function call is in-cluster (sub-ms) instead of
+# paying ~40 ms per Modal API hop from a developer laptop. Clients reach the
+# server via a `modal.forward` HTTPS+H2 tunnel.
+# ---------------------------------------------------------------------------
+
+# Long timeout so a single invocation can serve a long Bazel session.
+_REMOTE_SERVE_TIMEOUT = 24 * 60 * 60
+
+
+async def _serve_with_tunnel(
+    port: int,
+    exec_enabled: bool,
+    max_blob_size: int,
+    max_batch_size: int,
+    auth_token: str,
+) -> None:
+    server = _build_server(
+        port=port,
+        exec_enabled=exec_enabled,
+        max_blob_size=max_blob_size,
+        max_batch_size=max_batch_size,
+        auth_token=auth_token,
+    )
+    await server.start()
+    asyncio.create_task(_print_rpc_stats())
+    async with modal.forward(port, h2_enabled=True) as tunnel:
+        grpcs_url = tunnel.url.replace("https://", "grpcs://", 1)
+        log.info("RBE backend listening at %s (in-cluster)", tunnel.url)
+        log.info("")
+        log.info("Configure Bazel with:")
+        log.info("    --remote_cache=%s", grpcs_url)
+        if exec_enabled:
+            log.info("    --remote_executor=%s", grpcs_url)
+        log.info("    --remote_header=authorization=Bearer %s", auth_token)
+        log.info("")
+        await server.wait_for_termination()
+
+
+@app.function(
+    image=cache_image,
+    min_containers=1,
+    max_containers=1,
+    timeout=_REMOTE_SERVE_TIMEOUT,
+)
+def serve_remote(
+    port: int = 50051,
+    exec_enabled: bool = True,
+    max_blob_size: int = DEFAULT_MAX_BLOB_SIZE,
+    max_batch_size: int = DEFAULT_MAX_BATCH_SIZE,
+    auth_token: str | None = None,
+) -> None:
+    """Run the gRPC server inside a Modal container, exposed via HTTPS+H2.
+
+    Invoke with ``modal run -m modal_rbe.server::serve_remote`` — the function
+    will print a `grpcs://...modal.host` URL plus a one-off Bearer token for
+    Bazel to use. Set MODAL_RBE_AUTH_TOKEN in the container env (or pass
+    ``--auth-token``) to reuse a stable token across restarts.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    token = auth_token or os.environ.get("MODAL_RBE_AUTH_TOKEN") or secrets.token_urlsafe(24)
+    asyncio.run(
+        _serve_with_tunnel(
+            port=port,
+            exec_enabled=exec_enabled,
+            max_blob_size=max_blob_size,
+            max_batch_size=max_batch_size,
+            auth_token=token,
+        )
+    )

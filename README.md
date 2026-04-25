@@ -29,9 +29,53 @@ modal token new              # one-time, if you haven't authed
 
 ## Run the server
 
+Two modes:
+
+### Local-side server (cache + executor proxy)
+
+The gRPC server runs on the developer's laptop and proxies every RPC into
+Modal. Bazel hits `grpc://localhost:50051`. Each Modal API call costs ~40 ms
+RTT, so this is mostly useful for local iteration where the laptop is the
+client.
+
 ```bash
 uv run modal run -m modal_rbe.server::serve
 ```
+
+### In-cluster server (recommended for performance)
+
+The gRPC server runs *inside* a Modal container so every Dict / Volume /
+Function call is in-cluster (sub-ms). The container is exposed to the public
+internet via `modal.forward(..., h2_enabled=True)` and protected by a Bearer
+token printed at startup.
+
+```bash
+uv run modal run -m modal_rbe.server::serve_remote
+```
+
+The function prints something like:
+
+```
+RBE backend listening at https://<random>.modal.host
+Configure Bazel with:
+    --remote_cache=grpcs://<random>.modal.host
+    --remote_executor=grpcs://<random>.modal.host
+    --remote_header=authorization=Bearer <token>
+```
+
+Drop the three flags into your workspace's `.bazelrc` (the
+`--remote_header` value must be quoted because of the space):
+
+```
+build --remote_cache=grpcs://<random>.modal.host
+build --remote_executor=grpcs://<random>.modal.host
+build --remote_header=authorization="Bearer <token>"
+build --remote_instance_name=default
+build --remote_timeout=300
+```
+
+To reuse a stable token across redeploys, set `MODAL_RBE_AUTH_TOKEN` in the
+container environment instead of letting `serve_remote` mint one.
 
 Flags:
 
