@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import secrets
 
 import modal_rbe  # noqa: F401  (side-effecting: registers proto path)
 
@@ -191,6 +190,14 @@ def serve(
 # Long timeout so a single invocation can serve a long Bazel session.
 _REMOTE_SERVE_TIMEOUT = 24 * 60 * 60
 
+# Modal Secret that holds the bearer token. Create/refresh with the
+# `init_auth_secret` local_entrypoint below.
+_AUTH_SECRET_NAME = "rbe-auth-token"
+_AUTH_SECRET_KEY = "MODAL_RBE_AUTH_TOKEN"
+_auth_secret = modal.Secret.from_name(
+    _AUTH_SECRET_NAME, required_keys=[_AUTH_SECRET_KEY]
+)
+
 
 async def _serve_with_tunnel(
     port: int,
@@ -223,6 +230,7 @@ async def _serve_with_tunnel(
 
 @app.function(
     image=cache_image,
+    secrets=[_auth_secret],
     min_containers=1,
     max_containers=1,
     timeout=_REMOTE_SERVE_TIMEOUT,
@@ -232,20 +240,19 @@ def serve_remote(
     exec_enabled: bool = True,
     max_blob_size: int = DEFAULT_MAX_BLOB_SIZE,
     max_batch_size: int = DEFAULT_MAX_BATCH_SIZE,
-    auth_token: str | None = None,
 ) -> None:
     """Run the gRPC server inside a Modal container, exposed via HTTPS+H2.
 
     Invoke with ``modal run -m modal_rbe.server::serve_remote`` — the function
-    will print a `grpcs://...modal.host` URL plus a one-off Bearer token for
-    Bazel to use. Set MODAL_RBE_AUTH_TOKEN in the container env (or pass
-    ``--auth-token``) to reuse a stable token across restarts.
+    will print a `grpcs://...modal.host` URL plus the Bearer token for Bazel
+    to use. The token is read from the `rbe-auth-token` Modal Secret; create
+    it once with ``modal run -m modal_rbe.server::init_auth_secret``.
     """
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    token = auth_token or os.environ.get("MODAL_RBE_AUTH_TOKEN") or secrets.token_urlsafe(24)
+    token = os.environ[_AUTH_SECRET_KEY]
     asyncio.run(
         _serve_with_tunnel(
             port=port,
@@ -255,3 +262,5 @@ def serve_remote(
             auth_token=token,
         )
     )
+
+

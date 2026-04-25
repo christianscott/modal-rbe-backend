@@ -47,7 +47,16 @@ uv run modal run -m modal_rbe.server::serve
 The gRPC server runs *inside* a Modal container so every Dict / Volume /
 Function call is in-cluster (sub-ms). The container is exposed to the public
 internet via `modal.forward(..., h2_enabled=True)` and protected by a Bearer
-token printed at startup.
+token stored in a Modal Secret named `rbe-auth-token`.
+
+One-time setup (creates / refreshes the secret with a random token):
+
+```bash
+uv run python -m modal_rbe.setup_secret           # mint a fresh token
+uv run python -m modal_rbe.setup_secret <token>   # use a specific token
+```
+
+Run the server:
 
 ```bash
 uv run modal run -m modal_rbe.server::serve_remote
