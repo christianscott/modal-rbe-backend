@@ -26,8 +26,14 @@ log = logging.getLogger("modal_rbe")
 
 # Cap on a single ByteStream blob upload (4 GiB).
 MAX_BLOB_SIZE = 4 * 1024 * 1024 * 1024
-# Cap advertised in GetCapabilities for batched RPCs (matches gRPC default).
-MAX_BATCH_SIZE = 4 * 1024 * 1024
+# Cap advertised in GetCapabilities for batched RPCs. We override gRPC's
+# 4 MiB default so Bazel can pack more blobs per BatchReadBlobs/BatchUpdate
+# RPC (each message has fixed RTT cost; bigger batches = fewer round-trips
+# during the link action's input fetch). The server's gRPC channel is
+# configured with matching send/receive limits below.
+MAX_BATCH_SIZE = 32 * 1024 * 1024
+# Headroom over MAX_BATCH_SIZE so framing/proto overhead doesn't trip the limit.
+_GRPC_MESSAGE_LIMIT = 64 * 1024 * 1024
 PORT = 50051
 # Long timeout — the container hosts a long-running gRPC server.
 SERVE_TIMEOUT = 24 * 60 * 60
@@ -105,7 +111,13 @@ class _BearerAuthInterceptor(grpc.aio.ServerInterceptor):
 
 
 def _build_server(auth_token: str) -> grpc.aio.Server:
-    server = grpc.aio.server(interceptors=[_BearerAuthInterceptor(auth_token)])
+    server = grpc.aio.server(
+        interceptors=[_BearerAuthInterceptor(auth_token)],
+        options=[
+            ("grpc.max_send_message_length", _GRPC_MESSAGE_LIMIT),
+            ("grpc.max_receive_message_length", _GRPC_MESSAGE_LIMIT),
+        ],
+    )
     rex_grpc.add_CapabilitiesServicer_to_server(
         CapabilitiesServicer(exec_enabled=True, max_batch_size=MAX_BATCH_SIZE),
         server,
@@ -138,6 +150,12 @@ async def _print_rpc_stats() -> None:
 
 
 async def _serve_with_tunnel(auth_token: str) -> None:
+    from .servicers.ac_servicer import bootstrap_ac_cache
+
+    cas_n, ac_n = await asyncio.gather(
+        _cas.bootstrap_known_keys(), bootstrap_ac_cache()
+    )
+    log.info("bootstrapped cas_index=%d ac_cache=%d", cas_n, ac_n)
     server = _build_server(auth_token)
     await server.start()
     asyncio.create_task(_print_rpc_stats())
