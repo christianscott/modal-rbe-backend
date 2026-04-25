@@ -27,11 +27,46 @@ uv sync --extra dev          # install runtime + grpcio-tools
 modal token new              # one-time, if you haven't authed
 ```
 
-## Run the server
+## Deploy
+
+The server runs as a Modal-hosted `@app.cls` (`RbeServer`). It auto-starts on
+container boot via `@modal.enter()` and stays alive for the lifetime of the
+container; `min_containers=1` keeps one container warm at all times.
+
+One-time bootstrap of the bearer-token Secret:
 
 ```bash
-uv run modal run -m modal_rbe.server::serve
+uv run python -m modal_rbe.setup_secret           # mint a fresh token
+uv run python -m modal_rbe.setup_secret <token>   # use a specific token
 ```
+
+Deploy:
+
+```bash
+uv run modal deploy modal_rbe.server
+```
+
+After a few seconds, fetch the URL of the running container's tunnel:
+
+```bash
+uv run python -m modal_rbe.url             # grpcs://...modal.host
+uv run python -m modal_rbe.url --bazelrc   # ready-to-paste snippet
+```
+
+Drop the URL + token into your workspace's `.bazelrc` (the `--remote_header`
+value must be quoted because of the space):
+
+```
+build --remote_cache=grpcs://<random>.modal.host
+build --remote_executor=grpcs://<random>.modal.host
+build --remote_header=authorization="Bearer <token>"
+build --remote_instance_name=default
+build --remote_timeout=300
+```
+
+The tunnel URL is regenerated on each container restart, so re-run
+`python -m modal_rbe.url` after a redeploy. The Bearer token is stable across
+restarts (lives in the `rbe-auth-token` Modal Secret).
 
 Flags:
 
