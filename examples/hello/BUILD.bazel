@@ -1,0 +1,25 @@
+genrule(
+    name = "greet",
+    outs = ["greet.txt"],
+    cmd = "echo 'hello from modal RBE' > $@",
+)
+
+genrule(
+    name = "math",
+    outs = ["sum.txt"],
+    cmd = "echo $$((2 + 2)) > $@",
+)
+
+genrule(
+    name = "compose",
+    srcs = [":greet", ":math"],
+    outs = ["compose.txt"],
+    cmd = "cat $(location :greet) $(location :math) > $@",
+)
+
+# 6 MiB output — exceeds CAS small-blob threshold, exercises the Volume path.
+genrule(
+    name = "big_blob",
+    outs = ["big.bin"],
+    cmd = "head -c 6291456 /dev/urandom > $@",
+)

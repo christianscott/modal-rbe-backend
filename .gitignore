@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.venv/
+.uv/
+dist/
+/build/
+*.egg-info/
+
+# generated proto bindings
+modal_rbe/_proto/
+
+# session state
+.claude/
+
+# upstream clones used for benchmarking
+examples/bazel-remote/
+
+# bazel artefacts in example workspaces
+bazel-*

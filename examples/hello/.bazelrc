@@ -1,0 +1,6 @@
+build --remote_cache=grpc://localhost:50051
+build --remote_executor=grpc://localhost:50051
+build --remote_instance_name=default
+build --remote_timeout=300
+build --verbose_failures
+common --enable_bzlmod
