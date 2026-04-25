@@ -24,12 +24,25 @@ import os
 
 from .app import CAS_MOUNT, app, cache_image, cas_dict, cas_volume
 from .digest import cas_path, ensure_parent, sha256_bytes
+from .lru import BoundedLruSet
 
 SMALL_THRESHOLD = 32 * 1024 * 1024  # blobs ≤ 32 MiB live inline in the Dict
 
 # SHA-256 of the empty string. Bazel references it for empty stdout/stderr but
 # never uploads it, so we have to treat it as always-present.
 EMPTY_HASH = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+# Bounded LRU of CAS keys we've confirmed are present (via successful writes
+# or reads). It's a STRICT SUBSET of `cas_dict` — we only add keys we've seen
+# — so a false "missing" answer is harmless (Bazel re-uploads), but we never
+# falsely answer "present". Cache misses fall through to per-hash
+# `cas_dict.contains` RPCs.
+CAS_INDEX_MAXSIZE = 100_000
+_known_keys = BoundedLruSet(CAS_INDEX_MAXSIZE)
+
+
+def _remember(hash_: str) -> None:
+    _known_keys.add(hash_)
 
 # Tag bytes prefixed onto every cas_dict value to disambiguate inline bytes
 # from a "look on the volume" marker.
@@ -77,13 +90,20 @@ def _decode(val: bytes | None) -> tuple[str, bytes | None]:
 async def find_missing(hashes: list[str]) -> list[str]:
     if not hashes:
         return []
-    to_check = [h for h in hashes if h != EMPTY_HASH]
+    # Skip the empty-hash sentinel and any hash we've confirmed present.
+    to_check = [h for h in hashes if h != EMPTY_HASH and h not in _known_keys]
     if not to_check:
         return []
     present = await asyncio.gather(
         *(_gated(cas_dict.contains.aio(h)) for h in to_check)
     )
-    return [h for h, p in zip(to_check, present) if not p]
+    missing: list[str] = []
+    for h, p in zip(to_check, present):
+        if p:
+            _remember(h)
+        else:
+            missing.append(h)
+    return missing
 
 
 async def read(hash_: str) -> bytes | None:
@@ -92,8 +112,10 @@ async def read(hash_: str) -> bytes | None:
     val = await _gated(cas_dict.get.aio(hash_, None))
     state, inline = _decode(val)
     if state == "inline":
+        _remember(hash_)
         return inline
     if state == "volume":
+        _remember(hash_)
         return await _gated(_volume_read.remote.aio(hash_))
     return None
 
@@ -111,6 +133,7 @@ async def write(hash_: str, size: int, blob: bytes) -> None:
         # write has succeeded so a marker always implies bytes are present.
         await _gated(_volume_write.remote.aio(hash_, size, blob))
         await _gated(cas_dict.put.aio(hash_, _VOLUME_MARKER))
+    _remember(hash_)
 
 
 async def batch_read(hashes: list[str]) -> list[tuple[str, bytes | None]]:
@@ -132,8 +155,10 @@ async def batch_read(hashes: list[str]) -> list[tuple[str, bytes | None]]:
     for h, v in zip(to_fetch, vals):
         state, inline = _decode(v)
         if state == "inline":
+            _remember(h)
             out.append((h, inline))
         elif state == "volume":
+            _remember(h)
             volume_hashes.append(h)
         else:
             out.append((h, None))
@@ -164,12 +189,16 @@ async def batch_update(blobs: list[tuple[str, int, bytes]]) -> list[tuple[str, s
             large.append((h, sz, b))
     if small:
         await cas_dict.update.aio(small)
+        for h in small:
+            _remember(h)
         results.extend((h, "") for h in small)
     if large:
         large_results = await _volume_batch_update.remote.aio(large)
         markers = {h: _VOLUME_MARKER for h, err in large_results if not err}
         if markers:
             await cas_dict.update.aio(markers)
+            for h in markers:
+                _remember(h)
         results.extend(large_results)
     return results
 

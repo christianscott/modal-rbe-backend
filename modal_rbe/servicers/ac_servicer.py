@@ -8,7 +8,14 @@ from build.bazel.remote.execution.v2 import remote_execution_pb2_grpc as rex_grp
 
 from .. import cas as cas_store
 from ..app import ac_dict
+from ..lru import BoundedLruDict
 from ..telemetry import timed
+
+# Bounded LRU mirror of `ac_dict`. Populated lazily on Get/Update; evicts
+# least-recently-used entries when the count exceeds AC_CACHE_MAXSIZE. No
+# boot-time fill — entries flow in as Bazel actually asks for them.
+AC_CACHE_MAXSIZE = 50_000
+_ac_cache: BoundedLruDict = BoundedLruDict(AC_CACHE_MAXSIZE)
 
 log = logging.getLogger(__name__)
 
@@ -30,7 +37,11 @@ class ActionCacheServicer(rex_grpc.ActionCacheServicer):
     async def GetActionResult(self, request, context):  # noqa: N802
       with timed("GetActionResult"):
         h = request.action_digest.hash
-        blob = await ac_dict.get.aio(h, None)
+        blob = _ac_cache.get(h)
+        if blob is None:
+            blob = await ac_dict.get.aio(h, None)
+            if blob is not None:
+                _ac_cache.put(h, blob)
         if blob is None:
             await context.abort(grpc.StatusCode.NOT_FOUND, f"AC miss for {h}")
             return
@@ -54,5 +65,7 @@ class ActionCacheServicer(rex_grpc.ActionCacheServicer):
     async def UpdateActionResult(self, request, context):  # noqa: N802
       with timed("UpdateActionResult"):
         h = request.action_digest.hash
-        await ac_dict.put.aio(h, request.action_result.SerializeToString())
+        blob = request.action_result.SerializeToString()
+        await ac_dict.put.aio(h, blob)
+        _ac_cache.put(h, blob)
         return request.action_result
