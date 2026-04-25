@@ -150,12 +150,6 @@ async def _print_rpc_stats() -> None:
 
 
 async def _serve_with_tunnel(auth_token: str) -> None:
-    from .servicers.ac_servicer import bootstrap_ac_cache
-
-    cas_n, ac_n = await asyncio.gather(
-        _cas.bootstrap_known_keys(), bootstrap_ac_cache()
-    )
-    log.info("bootstrapped cas_index=%d ac_cache=%d", cas_n, ac_n)
     server = _build_server(auth_token)
     await server.start()
     asyncio.create_task(_print_rpc_stats())

@@ -24,6 +24,7 @@ import os
 
 from .app import CAS_MOUNT, app, cache_image, cas_dict, cas_volume
 from .digest import cas_path, ensure_parent, sha256_bytes
+from .lru import BoundedLruSet
 
 SMALL_THRESHOLD = 32 * 1024 * 1024  # blobs ≤ 32 MiB live inline in the Dict
 
@@ -31,26 +32,13 @@ SMALL_THRESHOLD = 32 * 1024 * 1024  # blobs ≤ 32 MiB live inline in the Dict
 # never uploads it, so we have to treat it as always-present.
 EMPTY_HASH = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
-# In-memory mirror of cas_dict's key set. find_missing consults this set
-# directly instead of doing per-hash dict.contains RPCs (which dominate
-# `GetActionResult`'s freshness check and put 87 ms on the per-AC critical
-# path). The mirror is a STRICT SUBSET of cas_dict — we only add keys we've
-# successfully written or observed via get — which is the safe direction:
-# we may falsely report a blob as missing (Bazel re-uploads, harmless) but
-# never falsely report it as present.
-_known_keys: set[str] = set()
-_known_keys_ready = False
-
-
-async def bootstrap_known_keys() -> int:
-    """Populate the in-memory key mirror from cas_dict. Run once at startup."""
-    global _known_keys_ready
-    n = 0
-    async for k in cas_dict.keys.aio():
-        _known_keys.add(k)
-        n += 1
-    _known_keys_ready = True
-    return n
+# Bounded LRU of CAS keys we've confirmed are present (via successful writes
+# or reads). It's a STRICT SUBSET of `cas_dict` — we only add keys we've seen
+# — so a false "missing" answer is harmless (Bazel re-uploads), but we never
+# falsely answer "present". Cache misses fall through to per-hash
+# `cas_dict.contains` RPCs.
+CAS_INDEX_MAXSIZE = 100_000
+_known_keys = BoundedLruSet(CAS_INDEX_MAXSIZE)
 
 
 def _remember(hash_: str) -> None:
@@ -102,17 +90,20 @@ def _decode(val: bytes | None) -> tuple[str, bytes | None]:
 async def find_missing(hashes: list[str]) -> list[str]:
     if not hashes:
         return []
-    if _known_keys_ready:
-        # Pure in-memory check; no Modal hops.
-        return [h for h in hashes if h != EMPTY_HASH and h not in _known_keys]
-    # Fallback (shouldn't happen post-bootstrap): per-hash contains via Modal.
-    to_check = [h for h in hashes if h != EMPTY_HASH]
+    # Skip the empty-hash sentinel and any hash we've confirmed present.
+    to_check = [h for h in hashes if h != EMPTY_HASH and h not in _known_keys]
     if not to_check:
         return []
     present = await asyncio.gather(
         *(_gated(cas_dict.contains.aio(h)) for h in to_check)
     )
-    return [h for h, p in zip(to_check, present) if not p]
+    missing: list[str] = []
+    for h, p in zip(to_check, present):
+        if p:
+            _remember(h)
+        else:
+            missing.append(h)
+    return missing
 
 
 async def read(hash_: str) -> bytes | None:

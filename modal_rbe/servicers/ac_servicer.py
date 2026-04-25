@@ -8,25 +8,14 @@ from build.bazel.remote.execution.v2 import remote_execution_pb2_grpc as rex_grp
 
 from .. import cas as cas_store
 from ..app import ac_dict
+from ..lru import BoundedLruDict
 from ..telemetry import timed
 
-# Process-local mirror of ac_dict, pre-warmed at container start. Halves
-# `check cache hit` latency by skipping the per-AC Modal Dict round-trip
-# (~40 ms in-cluster) on the hot path. The cache is updated on every
-# `UpdateActionResult` so a successor build sees its predecessor's writes.
-_ac_cache: dict[str, bytes] = {}
-_ac_cache_ready = False
-
-
-async def bootstrap_ac_cache() -> int:
-    """Populate the in-memory AC cache from ac_dict. Run once at startup."""
-    global _ac_cache_ready
-    n = 0
-    async for k, v in ac_dict.items.aio():
-        _ac_cache[k] = v
-        n += 1
-    _ac_cache_ready = True
-    return n
+# Bounded LRU mirror of `ac_dict`. Populated lazily on Get/Update; evicts
+# least-recently-used entries when the count exceeds AC_CACHE_MAXSIZE. No
+# boot-time fill — entries flow in as Bazel actually asks for them.
+AC_CACHE_MAXSIZE = 50_000
+_ac_cache: BoundedLruDict = BoundedLruDict(AC_CACHE_MAXSIZE)
 
 log = logging.getLogger(__name__)
 
@@ -52,7 +41,7 @@ class ActionCacheServicer(rex_grpc.ActionCacheServicer):
         if blob is None:
             blob = await ac_dict.get.aio(h, None)
             if blob is not None:
-                _ac_cache[h] = blob
+                _ac_cache.put(h, blob)
         if blob is None:
             await context.abort(grpc.StatusCode.NOT_FOUND, f"AC miss for {h}")
             return
@@ -78,5 +67,5 @@ class ActionCacheServicer(rex_grpc.ActionCacheServicer):
         h = request.action_digest.hash
         blob = request.action_result.SerializeToString()
         await ac_dict.put.aio(h, blob)
-        _ac_cache[h] = blob
+        _ac_cache.put(h, blob)
         return request.action_result
