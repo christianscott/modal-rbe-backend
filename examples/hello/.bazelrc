@@ -1,6 +1,10 @@
-build --remote_cache=grpc://localhost:50051
-build --remote_executor=grpc://localhost:50051
+common --enable_bzlmod
+
+# Endpoint + token are dynamic per deploy; copy `.bazelrc.local.example` to
+# `.bazelrc.local` and fill in current values from `modal_rbe.url` and the
+# rbe-auth-token Modal Secret.
+try-import %workspace%/.bazelrc.local
+
 build --remote_instance_name=default
 build --remote_timeout=300
 build --verbose_failures
-common --enable_bzlmod
