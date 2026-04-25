@@ -27,53 +27,34 @@ uv sync --extra dev          # install runtime + grpcio-tools
 modal token new              # one-time, if you haven't authed
 ```
 
-## Run the server
+## Deploy
 
-Two modes:
+The server runs as a Modal-hosted `@app.cls` (`RbeServer`). It auto-starts on
+container boot via `@modal.enter()` and stays alive for the lifetime of the
+container; `min_containers=1` keeps one container warm at all times.
 
-### Local-side server (cache + executor proxy)
-
-The gRPC server runs on the developer's laptop and proxies every RPC into
-Modal. Bazel hits `grpc://localhost:50051`. Each Modal API call costs ~40 ms
-RTT, so this is mostly useful for local iteration where the laptop is the
-client.
-
-```bash
-uv run modal run -m modal_rbe.server::serve
-```
-
-### In-cluster server (recommended for performance)
-
-The gRPC server runs *inside* a Modal container so every Dict / Volume /
-Function call is in-cluster (sub-ms). The container is exposed to the public
-internet via `modal.forward(..., h2_enabled=True)` and protected by a Bearer
-token stored in a Modal Secret named `rbe-auth-token`.
-
-One-time setup (creates / refreshes the secret with a random token):
+One-time bootstrap of the bearer-token Secret:
 
 ```bash
 uv run python -m modal_rbe.setup_secret           # mint a fresh token
 uv run python -m modal_rbe.setup_secret <token>   # use a specific token
 ```
 
-Run the server:
+Deploy:
 
 ```bash
-uv run modal run -m modal_rbe.server::serve_remote
+uv run modal deploy modal_rbe.server
 ```
 
-The function prints something like:
+After a few seconds, fetch the URL of the running container's tunnel:
 
-```
-RBE backend listening at https://<random>.modal.host
-Configure Bazel with:
-    --remote_cache=grpcs://<random>.modal.host
-    --remote_executor=grpcs://<random>.modal.host
-    --remote_header=authorization=Bearer <token>
+```bash
+uv run python -m modal_rbe.url             # grpcs://...modal.host
+uv run python -m modal_rbe.url --bazelrc   # ready-to-paste snippet
 ```
 
-Drop the three flags into your workspace's `.bazelrc` (the
-`--remote_header` value must be quoted because of the space):
+Drop the URL + token into your workspace's `.bazelrc` (the `--remote_header`
+value must be quoted because of the space):
 
 ```
 build --remote_cache=grpcs://<random>.modal.host
@@ -83,8 +64,9 @@ build --remote_instance_name=default
 build --remote_timeout=300
 ```
 
-To reuse a stable token across redeploys, set `MODAL_RBE_AUTH_TOKEN` in the
-container environment instead of letting `serve_remote` mint one.
+The tunnel URL is regenerated on each container restart, so re-run
+`python -m modal_rbe.url` after a redeploy. The Bearer token is stable across
+restarts (lives in the `rbe-auth-token` Modal Secret).
 
 Flags:
 
