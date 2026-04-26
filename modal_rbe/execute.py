@@ -5,6 +5,9 @@ import os
 import stat
 import subprocess
 import tempfile
+import threading
+
+import modal
 
 from .app import CAS_MOUNT, ac_dict, app, cas_dict, cas_volume, exec_image
 from .cas import SMALL_THRESHOLD, _INLINE, _VOLUME_MARKER
@@ -16,9 +19,28 @@ DEFAULT_ACTION_TIMEOUT_S = 600
 EXEC_FUNCTION_TIMEOUT = 3600
 
 
-# Tracks whether the executor wrote any large blob to the volume during the
-# action; if so we commit at the end, otherwise we skip the commit RPC.
-_volume_dirty = {"flag": False}
+# Tracks (per-thread) whether the current action wrote any large blob to the
+# volume; if so we commit at the end. A thread-local flag is required because
+# `@modal.concurrent` runs concurrent actions in worker threads in the same
+# process — a process-global flag would race.
+_tls = threading.local()
+
+
+def _mark_volume_dirty() -> None:
+    _tls.volume_dirty = True
+
+
+def _consume_volume_dirty() -> bool:
+    flag = getattr(_tls, "volume_dirty", False)
+    _tls.volume_dirty = False
+    return flag
+
+
+# Per-container pool of materialized CAS blobs. Survives across action
+# invocations on the same container, so input materialization shrinks from
+# "copy every file from CAS" to "hardlink from the pool" once a blob has been
+# pulled once. Pool grows unbounded; relies on Modal's container recycling.
+POOL_DIR = "/cas-pool"
 
 
 def _read_blob(hash_: str) -> bytes:
@@ -36,6 +58,36 @@ def _read_blob(hash_: str) -> bytes:
         return f.read()
 
 
+def _ensure_in_pool(hash_: str) -> str:
+    """Ensure the blob is materialized at POOL_DIR/<hash[:2]>/<hash>.
+
+    Returns the pool path, suitable for `os.link(pool_path, target)`.
+    Safe under concurrent calls (multiple threads or invocations) — the
+    populate path uses a unique tempfile + atomic rename.
+    """
+    pool_path = os.path.join(POOL_DIR, hash_[:2], hash_)
+    if os.path.exists(pool_path):
+        return pool_path
+    os.makedirs(os.path.dirname(pool_path), exist_ok=True)
+    data = _read_blob(hash_)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=os.path.dirname(pool_path))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        # 0o755 on the inode lets per-action hardlinks pretend the file is
+        # either executable or not without rewriting the inode mode (which
+        # would alias across all hardlinks).
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, pool_path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+    return pool_path
+
+
 def _write_blob(data: bytes) -> tuple[str, int]:
     h = hashlib.sha256(data).hexdigest()
     sz = len(data)
@@ -46,18 +98,23 @@ def _write_blob(data: bytes) -> tuple[str, int]:
     path = cas_path(CAS_MOUNT, h)
     if not os.path.exists(path):
         ensure_parent(path)
-        tmp = path + ".tmp"
-        with open(tmp, "wb") as f:
+        fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=os.path.dirname(path))
+        with os.fdopen(fd, "wb") as f:
             f.write(data)
         os.replace(tmp, path)
-        _volume_dirty["flag"] = True
+        _mark_volume_dirty()
     if h not in cas_dict:
         cas_dict[h] = _VOLUME_MARKER
     return h, sz
 
 
 def _materialize_directory(directory_hash: str, dest: str) -> None:
-    """Recursively materialize a Directory proto rooted at directory_hash into dest."""
+    """Recursively materialize a Directory proto rooted at directory_hash into dest.
+
+    Files are hardlinked from a per-container CAS blob pool. The first action
+    that touches a given blob pays the file-copy cost; subsequent actions on
+    the same container get a near-free `os.link`.
+    """
     from build.bazel.remote.execution.v2 import remote_execution_pb2 as rex
 
     blob = _read_blob(directory_hash)
@@ -66,18 +123,16 @@ def _materialize_directory(directory_hash: str, dest: str) -> None:
     os.makedirs(dest, exist_ok=True)
     for f in d.files:
         path = os.path.join(dest, f.name)
-        ensure_parent(path)
-        with open(path, "wb") as out:
-            out.write(_read_blob(f.digest.hash))
-        if f.is_executable:
-            os.chmod(path, 0o755)
-        else:
-            os.chmod(path, 0o644)
+        pool_path = _ensure_in_pool(f.digest.hash)
+        try:
+            os.link(pool_path, path)
+        except FileExistsError:
+            os.unlink(path)
+            os.link(pool_path, path)
     for sub in d.directories:
         _materialize_directory(sub.digest.hash, os.path.join(dest, sub.name))
     for sym in d.symlinks:
         link_path = os.path.join(dest, sym.name)
-        ensure_parent(link_path)
         os.symlink(sym.target, link_path)
 
 
@@ -130,19 +185,30 @@ def _build_tree_for_output_dir(path: str):
     return rex.Digest(hash=h, size_bytes=sz)
 
 
+# Keep one executor container warm so the per-container hardlink pool
+# (POOL_DIR) doesn't get rebuilt from cold on every build. `min_containers=1`
+# pre-spawns the container after `modal deploy`; @modal.concurrent lets that
+# one container handle many parallel actions on shared rootfs (so the pool
+# is populated once and amortized across all subsequent actions).
+_EXEC_MAX_CONTAINERS = 4
+_EXEC_INPUT_CONCURRENCY = 4
+
+
 @app.function(
     image=exec_image,
     volumes={CAS_MOUNT: cas_volume},
     timeout=EXEC_FUNCTION_TIMEOUT,
-    max_containers=5,
+    min_containers=1,
+    max_containers=_EXEC_MAX_CONTAINERS,
 )
+@modal.concurrent(max_inputs=_EXEC_INPUT_CONCURRENCY)
 def execute_action(action_hash: str, action_size: int) -> bytes:
     """Run an action and return a serialized ExecuteResponse."""
     from build.bazel.remote.execution.v2 import remote_execution_pb2 as rex
     from google.rpc import code_pb2, status_pb2
 
     cas_volume.reload()
-    _volume_dirty["flag"] = False
+    _consume_volume_dirty()  # reset the per-thread flag
 
     action = rex.Action()
     action.ParseFromString(_read_blob(action_hash))
@@ -245,7 +311,8 @@ def execute_action(action_hash: str, action_size: int) -> bytes:
                     is_executable=is_exec,
                 )
 
-        if _volume_dirty["flag"]:
+
+        if _consume_volume_dirty():
             cas_volume.commit()
 
         # Persist to AC only on success and when allowed.
