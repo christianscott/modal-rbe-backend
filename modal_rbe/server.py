@@ -10,6 +10,7 @@ import modal_rbe  # noqa: F401  (side-effecting: registers proto path)
 import grpc
 import grpc.aio
 import modal
+import modal.experimental
 from build.bazel.remote.execution.v2 import remote_execution_pb2_grpc as rex_grpc
 from google.bytestream import bytestream_pb2_grpc as bs_grpc
 
@@ -45,11 +46,11 @@ _auth_secret = modal.Secret.from_name(
     _AUTH_SECRET_NAME, required_keys=[_AUTH_SECRET_KEY]
 )
 
-# The tunnel URL is dynamic per container start, so we publish it through a
-# small Dict that clients (e.g. `python -m modal_rbe.url`) can read.
-URL_DICT_NAME = "rbe-server-url"
-URL_DICT_KEY = "current"
-url_dict = modal.Dict.from_name(URL_DICT_NAME, create_if_missing=True)
+# `@modal.experimental.http_server` gives the deployed class a stable URL
+# bound to the app + class name (printed by `modal deploy`), so no separate
+# URL-discovery step is needed. Pin the proxy + executor region so request
+# RTT is one well-known hop.
+_PROXY_REGION = "us-east"
 
 
 # ---------------------------------------------------------------------------
@@ -149,33 +150,22 @@ async def _print_rpc_stats() -> None:
         log.info("rpcs in last 2s: %s", " | ".join(parts))
 
 
-async def _serve_with_tunnel(auth_token: str) -> None:
+async def _serve(auth_token: str) -> None:
     server = _build_server(auth_token)
     await server.start()
     asyncio.create_task(_print_rpc_stats())
-    async with modal.forward(PORT, h2_enabled=True) as tunnel:
-        grpcs_url = tunnel.url.replace("https://", "grpcs://", 1)
-        log.info("RBE backend listening at %s", tunnel.url)
-        log.info("    --remote_cache=%s", grpcs_url)
-        log.info("    --remote_executor=%s", grpcs_url)
-        log.info('    --remote_header=authorization="Bearer %s"', auth_token)
-        await url_dict.put.aio(URL_DICT_KEY, grpcs_url)
-        try:
-            await server.wait_for_termination()
-        finally:
-            try:
-                await url_dict.pop.aio(URL_DICT_KEY)
-            except Exception:  # noqa: BLE001
-                pass
+    log.info("RBE backend listening on :%d (Flash HTTP/2 proxy)", PORT)
+    await server.wait_for_termination()
 
 
 # ---------------------------------------------------------------------------
 # Deployable class
 #
-# `modal deploy modal_rbe.server` registers this class. With min_containers=1
-# Modal pre-starts a container; @modal.enter() boots the gRPC server in a
-# background thread and the tunnel URL is published via the Modal Dict
-# `rbe-server-url` for clients to read (`python -m modal_rbe.url`).
+# `@modal.experimental.http_server(h2_enabled=True)` puts the gRPC server
+# behind Modal's Flash HTTP/2 edge proxy with a stable URL bound to the
+# deployed app + class name (no per-container URL discovery, lower RTT
+# than `modal.forward`-per-container). Pin the class region to the same
+# region as `proxy_regions` to keep the proxy↔container hop in-AZ.
 # ---------------------------------------------------------------------------
 
 
@@ -185,6 +175,12 @@ async def _serve_with_tunnel(auth_token: str) -> None:
     min_containers=1,
     max_containers=1,
     timeout=SERVE_TIMEOUT,
+    region=_PROXY_REGION,
+)
+@modal.experimental.http_server(
+    port=PORT,
+    proxy_regions=[_PROXY_REGION],
+    h2_enabled=True,
 )
 class RbeServer:
     @modal.enter()
@@ -197,14 +193,10 @@ class RbeServer:
 
         def _run() -> None:
             try:
-                asyncio.run(_serve_with_tunnel(token))
+                asyncio.run(_serve(token))
             except Exception:  # noqa: BLE001
                 log.exception("gRPC server crashed; container will exit")
                 os._exit(1)
 
         # daemon=False keeps the process alive for the container's lifetime.
         threading.Thread(target=_run, daemon=False, name="rbe-grpc").start()
-
-    @modal.method()
-    def health(self) -> dict:
-        return {"url": url_dict.get(URL_DICT_KEY, None)}
