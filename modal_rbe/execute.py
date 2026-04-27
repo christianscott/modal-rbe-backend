@@ -363,12 +363,19 @@ def _execute_impl(action_hash: str, action_size: int) -> bytes:
 # ---------------------------------------------------------------------------
 
 
+# Pin executors to the same region as the Flash proxy (RbeServer) so the
+# in-cluster RbeServer→executor `.remote.aio()` round-trip stays in-AZ
+# instead of crossing regions on every action dispatch.
+_EXEC_REGION = "us-east"
+
+
 @app.function(
     image=default_exec_image,
     volumes={CAS_MOUNT: cas_volume},
     timeout=EXEC_FUNCTION_TIMEOUT,
     min_containers=1,
     max_containers=_EXEC_MAX_CONTAINERS,
+    region=_EXEC_REGION,
 )
 @modal.concurrent(max_inputs=_EXEC_INPUT_CONCURRENCY)
 def execute_default(action_hash: str, action_size: int) -> bytes:
@@ -383,6 +390,7 @@ def execute_default(action_hash: str, action_size: int) -> bytes:
     # min_containers=0 (default): scale to zero when no `Pool=light` traffic;
     # actions targeting this pool pay a cold-start tax on first request.
     max_containers=_EXEC_MAX_CONTAINERS,
+    region=_EXEC_REGION,
 )
 @modal.concurrent(max_inputs=_EXEC_INPUT_CONCURRENCY)
 def execute_light(action_hash: str, action_size: int) -> bytes:
