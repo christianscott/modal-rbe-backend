@@ -4,8 +4,6 @@ from build.bazel.remote.execution.v2 import remote_execution_pb2 as rex
 from build.bazel.remote.execution.v2 import remote_execution_pb2_grpc as rex_grpc
 from build.bazel.semver import semver_pb2
 
-# REAPI version we claim to support. v2.3 is widely deployed; bump as we add
-# features.
 _API_VERSION = semver_pb2.SemVer(major=2, minor=3)
 
 

@@ -7,7 +7,7 @@ from build.bazel.remote.execution.v2 import remote_execution_pb2 as rex
 from build.bazel.remote.execution.v2 import remote_execution_pb2_grpc as rex_grpc
 from google.rpc import code_pb2, status_pb2
 
-from .. import cas as cas_store
+from ..cache import CacheStore
 from ..telemetry import timed
 
 log = logging.getLogger(__name__)
@@ -22,11 +22,14 @@ def _err(code: int, msg: str) -> status_pb2.Status:
 
 
 class ContentAddressableStorageServicer(rex_grpc.ContentAddressableStorageServicer):
+    def __init__(self, cache: CacheStore) -> None:
+        self._cache = cache
+
     async def FindMissingBlobs(self, request, context):  # noqa: N802
         with timed(f"FindMissingBlobs[n={len(request.blob_digests)}]"):
             hashes = [d.hash for d in request.blob_digests]
             size_by_hash = {d.hash: d.size_bytes for d in request.blob_digests}
-            missing_hashes = await cas_store.find_missing(hashes)
+            missing_hashes = await self._cache.find_missing(hashes)
         return rex.FindMissingBlobsResponse(
             missing_blob_digests=[
                 rex.Digest(hash=h, size_bytes=size_by_hash[h]) for h in missing_hashes
@@ -37,7 +40,7 @@ class ContentAddressableStorageServicer(rex_grpc.ContentAddressableStorageServic
         with timed(f"BatchReadBlobs[n={len(request.digests)}]"):
             hashes = [d.hash for d in request.digests]
             size_by_hash = {d.hash: d.size_bytes for d in request.digests}
-            results = await cas_store.batch_read(hashes)
+            results = await self._cache.batch_read(hashes)
         responses = []
         for h, blob in results:
             d = rex.Digest(hash=h, size_bytes=size_by_hash[h])
@@ -57,11 +60,11 @@ class ContentAddressableStorageServicer(rex_grpc.ContentAddressableStorageServic
         return rex.BatchReadBlobsResponse(responses=responses)
 
     async def BatchUpdateBlobs(self, request, context):  # noqa: N802
-      with timed(f"BatchUpdateBlobs[n={len(request.requests)}]"):
-        blobs = [
-            (r.digest.hash, r.digest.size_bytes, r.data) for r in request.requests
-        ]
-        results = await cas_store.batch_update(blobs)
+        with timed(f"BatchUpdateBlobs[n={len(request.requests)}]"):
+            blobs = [
+                (r.digest.hash, r.digest.size_bytes, r.data) for r in request.requests
+            ]
+            results = await self._cache.batch_update(blobs)
         size_by_hash = {r.digest.hash: r.digest.size_bytes for r in request.requests}
         responses = []
         for h, err in results:
@@ -89,7 +92,7 @@ class ContentAddressableStorageServicer(rex_grpc.ContentAddressableStorageServic
             if h in seen:
                 continue
             seen.add(h)
-            blob = await cas_store.read(h)
+            blob = await self._cache.read(h)
             if blob is None:
                 await context.abort(
                     grpc.StatusCode.NOT_FOUND, f"directory {h} not in CAS"

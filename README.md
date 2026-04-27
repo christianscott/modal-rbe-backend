@@ -164,25 +164,84 @@ Incremental Go compile on `examples/exec-go` (1 source file changed,
 
 ## Layout
 
+The package splits into a reusable **library** (`modal_rbe.core`) and a
+specific **deployment** that uses it (`modal_rbe.{app,execute,server}`):
+
 ```
 modal_rbe/
-├── app.py            # modal.App, Volume + Dict defs, image definitions
-├── digest.py         # sha256 + path helpers shared between local and remote
-├── lru.py            # BoundedLruSet / BoundedLruDict (in-process caches)
-├── cas.py            # Hybrid CAS dispatch (Dict for small, Volume for large)
-├── execute.py        # execute_action Modal Function + hardlink pool
-├── server.py         # @app.cls RbeServer + auth interceptor
-├── resource_name.py  # ByteStream resource-name parser
-├── setup_secret.py   # one-time bootstrap of rbe-auth-token Secret
-├── telemetry.py      # per-RPC timing snapshots (printed every 2 s)
-├── servicers/        # one file per gRPC service
-│   ├── capabilities.py
-│   ├── cas_servicer.py
-│   ├── ac_servicer.py
-│   ├── bytestream.py
-│   └── execution.py
-└── _proto/           # generated, gitignored
+├── core/                    # reusable library — no decorators at module scope
+│   ├── cache.py             #   CacheStore + make_cache_store()
+│   ├── execute_impl.py      #   execute_action_impl() + hardlink pool
+│   ├── grpc_server.py       #   build_grpc_server() + auth interceptor
+│   ├── images.py            #   default_image_base()
+│   ├── digest.py            #   sha256 + path helpers
+│   ├── lru.py               #   BoundedLruSet / BoundedLruDict
+│   ├── resource_name.py     #   ByteStream resource-name parser
+│   ├── telemetry.py         #   per-RPC timing snapshots
+│   └── servicers/           #   parametrized gRPC servicers
+│       ├── capabilities.py
+│       ├── cas_servicer.py
+│       ├── ac_servicer.py
+│       ├── bytestream.py
+│       └── execution.py
+├── app.py                   # default deployment: App, images, CacheStore
+├── execute.py               # default deployment: per-pool @app.function
+├── server.py                # default deployment: @app.cls RbeServer
+├── setup_secret.py          # one-time bootstrap of rbe-auth-token Secret
+└── _proto/                  # generated, gitignored
+
+examples/
+├── hello/                   # genrule smoke test
+├── exec-go/                 # cross-compile demo
+└── multipool/               # custom deployment with default + node + playwright pools
 ```
+
+### Building a custom deployment
+
+To run a different set of pools (different toolchains, different region,
+different resource caps), don't edit the canonical `modal_rbe.{app,execute,
+server}`. Instead write your own `app.py` against `modal_rbe.core`:
+
+```python
+import modal, modal.experimental
+from modal_rbe.core import (
+    default_image_base, make_cache_store,
+    execute_action_impl, serve_forever,
+)
+
+app = modal.App("my-rbe")
+cas_volume = modal.Volume.from_name("rbe-cas", create_if_missing=True)
+# ... etc
+
+cache_image = default_image_base().add_local_python_source("modal_rbe")
+cache = make_cache_store(
+    app=app, cache_image=cache_image,
+    cas_volume=cas_volume, cas_dict=cas_dict, ac_dict=ac_dict,
+    region="us-east",
+)
+
+@app.function(image=my_image, volumes={cache.cas_mount: cas_volume}, ...)
+@modal.concurrent(max_inputs=4)
+def execute_my_pool(h, sz):
+    return execute_action_impl(h, sz, cache=cache)
+
+POOLS = {"default": execute_my_pool, ...}
+
+@app.cls(...)
+@modal.experimental.http_server(port=50051, h2_enabled=True, ...)
+class RbeServer:
+    @modal.enter()
+    def start(self):
+        token = os.environ["MODAL_RBE_AUTH_TOKEN"]
+        threading.Thread(
+            target=lambda: asyncio.run(serve_forever(
+                cache=cache, pools=POOLS, auth_token=token, port=50051,
+            )),
+            daemon=False,
+        ).start()
+```
+
+See `examples/multipool/app.py` for a full worked example.
 
 ## Limitations
 

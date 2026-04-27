@@ -1,37 +1,43 @@
+"""Default deployment: shared resources.
+
+This file plus `execute.py` and `server.py` are one specific deployment
+built on top of `modal_rbe.core`. Copy these three files (and adjust the
+images, region, pool list, etc.) to spin up a different deployment with
+its own pool configuration.
+"""
+
 from __future__ import annotations
 
 import modal
 
+from .core.cache import make_cache_store
+from .core.images import default_image_base
+
 APP_NAME = "rbe-backend"
+PROXY_REGION = "us-east"
+PORT = 50051
 
 app = modal.App(APP_NAME)
 
 cas_volume = modal.Volume.from_name("rbe-cas", create_if_missing=True)
-
-# Action Cache: small ActionResult protos keyed by action hash. modal.Dict is
-# a strongly-consistent K/V store — way better fit than a Volume for AC.
+cas_dict = modal.Dict.from_name("rbe-cas-small", create_if_missing=True)
 ac_dict = modal.Dict.from_name("rbe-ac", create_if_missing=True)
 
-# CAS small-blob hot path. Strongly consistent. Bazel's hot CAS traffic (action
-# protos, command protos, small source files) all fits here. Anything bigger
-# falls through to cas_volume.
-cas_dict = modal.Dict.from_name("rbe-cas-small", create_if_missing=True)
-
-CAS_MOUNT = "/cas"
-
-# Image used by all cache-plane Modal Functions. Only needs protobuf for
-# serializing/deserializing ActionResult etc.
-cache_image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .pip_install("protobuf>=4.25", "grpcio>=1.60")
-    .add_local_python_source("modal_rbe")
+# Auth token Modal Secret. Bootstrap with `python -m modal_rbe.setup_secret`.
+auth_secret = modal.Secret.from_name(
+    "rbe-auth-token", required_keys=["MODAL_RBE_AUTH_TOKEN"]
 )
 
-# Default executor image — covers a typical C/C++/Python build. Bazel
-# actions land here unless the action's Platform proto specifies a different
-# `Pool` exec_property (see modal_rbe/execute.py).
+# ---------------------------------------------------------------------------
+# Per-deployment images. Add toolchain bits on top of `default_image_base()`,
+# then add your local Python source so the executor can import the action
+# body (`execute_action_impl`) and the cache helpers.
+# ---------------------------------------------------------------------------
+
+cache_image = default_image_base().add_local_python_source("modal_rbe")
+
 default_exec_image = (
-    modal.Image.debian_slim(python_version="3.11")
+    default_image_base()
     .apt_install(
         "build-essential",
         "git",
@@ -40,19 +46,21 @@ default_exec_image = (
         "python3",
         "unzip",
     )
-    .pip_install("protobuf>=4.25", "grpcio>=1.60")
     .add_local_python_source("modal_rbe")
 )
 
-# A trimmed-down executor image with no apt packages — for actions that only
-# need the standard interpreter / shell. Demonstrates pool routing; pick
-# `Pool=light` from Bazel via exec_properties to land here.
-light_exec_image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .pip_install("protobuf>=4.25", "grpcio>=1.60")
-    .add_local_python_source("modal_rbe")
-)
+light_exec_image = default_image_base().add_local_python_source("modal_rbe")
 
-# Backwards-compatible alias; `exec_image` may still be imported by
-# downstream code.
-exec_image = default_exec_image
+# ---------------------------------------------------------------------------
+# CacheStore: registers the volume-side helpers on this app and bundles
+# every storage handle the executor + servicers need.
+# ---------------------------------------------------------------------------
+
+cache = make_cache_store(
+    app=app,
+    cache_image=cache_image,
+    cas_volume=cas_volume,
+    cas_dict=cas_dict,
+    ac_dict=ac_dict,
+    region=PROXY_REGION,
+)
