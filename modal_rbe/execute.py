@@ -192,6 +192,9 @@ def _build_tree_for_output_dir(path: str):
 # is populated once and amortized across all subsequent actions).
 _EXEC_MAX_CONTAINERS = 4
 _EXEC_INPUT_CONCURRENCY = 4
+# Note on disk: Modal gives every container 512 GiB of SSD-backed
+# `ephemeral_disk` by default (and that's also the minimum — Modal won't
+# accept a request smaller). The hardlink pool below lives on this scratch.
 
 
 @app.function(

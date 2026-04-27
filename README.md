@@ -122,6 +122,9 @@ Incremental Go compile on `examples/exec-go` (1 source file changed,
 - `min_containers=1`, `max_containers=4`, `@modal.concurrent(max_inputs=4)`.
   One container handles up to 4 actions in parallel; up to 4 containers
   can run if Bazel fans out widely.
+- Modal gives every container **512 GiB of SSD-backed scratch by default**
+  (`ephemeral_disk`); the hardlink pool lives on it. 512 GiB is also
+  Modal's *minimum* — you can't request smaller.
 - **Per-container hardlink pool at `/cas-pool/<hash[:2]>/<hash>`.** Each
   blob is materialized once on first reference; subsequent actions on the
   same container hardlink from the pool into per-action workspaces via
@@ -162,9 +165,12 @@ modal_rbe/
 
 ## Limitations
 
-- **No persistent fast local disk.** Modal doesn't expose per-machine NVMe;
-  the executor's hardlink pool is rebuilt from cold whenever Modal recycles
-  the container. `min_containers=1` keeps recycles infrequent in practice.
+- **No persistent fast local disk across container restarts.** The
+  executor's `ephemeral_disk` is SSD-backed and per-container, so the
+  hardlink pool is fast — but it's wiped whenever Modal recycles the
+  container. `min_containers=1` keeps recycles infrequent in practice.
+  Modal doesn't expose anything that survives recycle (e.g. an attached
+  NVMe scoped to the worker).
 - **Single executor image.** Every action runs in `exec_image`. Per-action
   `Platform.container-image` hints are ignored.
 - **Wide-fanout builds top out at one container's vCPUs.** With
