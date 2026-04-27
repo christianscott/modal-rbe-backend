@@ -1,23 +1,31 @@
 # modal-rbe-backend
 
-A Bazel Remote Execution / Remote Cache backend that runs as a localhost gRPC
-server and proxies all traffic into [Modal](https://modal.com). Actions execute
-inside a Modal Function; cache state is split between a `modal.Dict` (hot path)
-and a `modal.Volume` (large blobs).
+A Bazel Remote Execution / Remote Cache backend deployed entirely on
+[Modal](https://modal.com). The gRPC server runs **inside** a Modal container,
+exposed to the public internet over HTTPS+H2 via `modal.forward`. Cache state
+is split between a `modal.Dict` (hot path) and a `modal.Volume` (large blobs).
+Actions execute in a separate Modal Function with a per-container hardlink
+pool to amortize input materialization.
 
 ```
- Bazel ──gRPC──▶ local server (modal local_entrypoint)
-                     │
-                     ├── AC ──────▶ modal.Dict   "rbe-ac"        (ActionResult protos)
-                     ├── CAS small ▶ modal.Dict   "rbe-cas-small" (≤4 MiB blobs)
-                     ├── CAS large ▶ Modal Function ▶ modal.Volume "rbe-cas"
-                     └── execute ──▶ Modal Function (fixed image, mounts cas_volume)
+ Bazel ──gRPCS──▶ modal.forward tunnel ──▶ RbeServer (@app.cls, in Modal)
+                                              │
+                              ┌───────────────┼─────────────────────────┐
+                              ▼               ▼                         ▼
+                       ac_dict (Dict)   cas_dict (Dict)        cas_volume (Volume)
+                        ActionResults   ≤32 MiB blobs           >32 MiB blobs
+                                                                       │
+                              ┌────────────────────────────────────────┘
+                              ▼
+                       execute_action (Modal Function, @modal.concurrent)
+                       — fixed exec_image
+                       — /cas-pool hardlink pool (per-container)
 ```
 
-The split keeps the hot paths (FindMissingBlobs, BatchReadBlobs, AC lookups)
-on a strongly-consistent K/V store, eliminating the volume reload/commit dance
-for ~all of Bazel's day-to-day cache traffic. Only blobs over 4 MiB hit the
-volume.
+The Dict is the authoritative presence map for CAS — `FindMissingBlobs` is a
+pure in-memory check against a bounded LRU mirror, never touching the volume.
+Volume reads only happen for blobs over 32 MiB. AC reads are served from a
+bounded LRU value cache, falling back to the Dict on miss.
 
 ## Setup
 
@@ -29,89 +37,105 @@ modal token new              # one-time, if you haven't authed
 
 ## Deploy
 
-The server runs as a Modal-hosted `@app.cls` (`RbeServer`). It auto-starts on
-container boot via `@modal.enter()` and stays alive for the lifetime of the
-container; `min_containers=1` keeps one container warm at all times.
-
-One-time bootstrap of the bearer-token Secret:
-
 ```bash
-uv run python -m modal_rbe.setup_secret           # mint a fresh token
-uv run python -m modal_rbe.setup_secret <token>   # use a specific token
+# 1. Bootstrap the bearer-token Secret (one-time):
+uv run python -m modal_rbe.setup_secret           # mint a random token
+uv run python -m modal_rbe.setup_secret <token>   # or use a specific token
+
+# 2. Deploy the app:
+uv run modal deploy -m modal_rbe.server
+
+# 3. Fetch the current tunnel URL (regenerated on each container restart):
+uv run python -m modal_rbe.url            # grpcs://...modal.host
+uv run python -m modal_rbe.url --bazelrc  # ready-to-paste .bazelrc snippet
 ```
 
-Deploy:
-
-```bash
-uv run modal deploy modal_rbe.server
-```
-
-After a few seconds, fetch the URL of the running container's tunnel:
-
-```bash
-uv run python -m modal_rbe.url             # grpcs://...modal.host
-uv run python -m modal_rbe.url --bazelrc   # ready-to-paste snippet
-```
-
-Drop the URL + token into your workspace's `.bazelrc` (the `--remote_header`
-value must be quoted because of the space):
-
-```
-build --remote_cache=grpcs://<random>.modal.host
-build --remote_executor=grpcs://<random>.modal.host
-build --remote_header=authorization="Bearer <token>"
-build --remote_instance_name=default
-build --remote_timeout=300
-```
-
-The tunnel URL is regenerated on each container restart, so re-run
-`python -m modal_rbe.url` after a redeploy. The Bearer token is stable across
-restarts (lives in the `rbe-auth-token` Modal Secret).
-
-Flags:
-
-| Flag | Default | Notes |
-|---|---|---|
-| `--port` | `50051` | gRPC port to bind on `localhost`. |
-| `--max-workers` | `32` | gRPC server thread pool size. |
-| `--exec-enabled` | `true` | Set to `false` to run as a cache-only proxy. |
-| `--max-blob-size` | `4 GiB` | Single ByteStream blob cap (buffered in local RAM). |
-| `--max-batch-size` | `4 MiB` | Cap advertised in `GetCapabilities` for batched RPCs. |
+The deployed app auto-starts via `@modal.enter()` (no separate `modal run`
+invocation needed) and stays alive thanks to `min_containers=1`. The Bearer
+token is stable across redeploys — it lives in the `rbe-auth-token` Modal
+Secret. The URL is dynamic per container boot, so re-run `python -m
+modal_rbe.url` after a redeploy or container recycle.
 
 ## Point Bazel at it
 
-Add to your workspace's `.bazelrc`:
+Drop the URL + token into your workspace's `.bazelrc` (the `--remote_header`
+value must be quoted because of the embedded space):
 
 ```
-build --remote_cache=grpc://localhost:50051
-build --remote_executor=grpc://localhost:50051   # omit for cache-only mode
+build --remote_cache=grpcs://<URL>.w.modal.host
+build --remote_executor=grpcs://<URL>.w.modal.host
+build --remote_header=authorization="Bearer <TOKEN>"
 build --remote_instance_name=default
 build --remote_timeout=300
 ```
 
-For cache-only use:
+Or omit `--remote_executor` to use it as a remote cache only. See
+`examples/hello/.bazelrc.local.example` and
+`examples/exec-go/.bazelrc.local.example` for templates.
 
-```bash
-uv run modal run -m modal_rbe.server::serve --no-exec-enabled
-```
+## Examples
 
-and only set `--remote_cache` in `.bazelrc`.
+- `examples/hello/` — three trivial genrules. Smoke test for the cache
+  plane and execution. With `--remote_executor`, all three run on Modal.
+- `examples/exec-go/` — a pure-Go binary built with `rules_go` targeting
+  `linux_amd64`. Forces every Go toolchain action (compile, link, stdlib)
+  onto the Modal executor; the local darwin host can't execute the linux
+  toolchain binaries. Useful for benchmarking remote execution latency.
 
-## Execution image
+## Performance shape
 
-The executor image is defined in `modal_rbe/app.py` as `exec_image`. It is the
-single image every action runs in — there is no per-action image selection in
-v1. Edit the image to add the toolchains your actions need (Bazel sets a
-`Platform` proto on each action, but v1 ignores it):
+Cached rebuild of `bazel-remote` (309 cache hits, 1 local link):
 
-```python
-exec_image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .apt_install("build-essential", "git", "curl", "python3", "unzip")
-    .pip_install("protobuf>=4.25", "grpcio>=1.60")
-    .add_local_python_source("modal_rbe")
-)
-```
+- ~3.9 s elapsed, ~2.2 s critical path
+- Critical path is dominated by the local `GoLink` and the Bazel→Modal RTT
+  (~30 ms per AC fetch on the chain)
+
+Incremental Go compile on `examples/exec-go` (1 source file changed,
+2 fresh remote actions):
+
+- ~6 s end-to-end after the executor's input pool has warmed up
+- First build after a container recycle is closer to ~20 s — the pool is
+  rebuilt from cold (Modal has no per-machine persistent fast disk)
+
+## Architecture details worth knowing
+
+### Cache plane
+
+- **`cas_dict` ("rbe-cas-small")** holds blobs ≤ 32 MiB inline with a 1-byte
+  tag (`\x00` = inline bytes, `\x01` = "look on the volume"). It's the
+  authoritative presence map; `find_missing` consults a bounded
+  in-process LRU mirror that's a strict subset of the Dict (false-missing
+  is harmless, false-present impossible).
+- **`cas_volume` ("rbe-cas")** stores blobs > 32 MiB. Reads use
+  optimistic-then-reload (`open` first, only call `volume.reload()` on
+  `FileNotFoundError`).
+- **`ac_dict` ("rbe-ac")** holds serialized `ActionResult` protos. A bounded
+  in-process LRU value cache fronts it; `GetActionResult` serves from
+  memory and falls back to the Dict on miss.
+- All RPC fan-out (e.g. `BatchReadBlobs`) is gated by a 64-permit
+  semaphore so we don't crush Modal's grpclib transport.
+
+### Execution plane
+
+- `execute_action` runs in a separate `@app.function` with `exec_image`
+  mounted with `cas_volume`.
+- `min_containers=1`, `max_containers=4`, `@modal.concurrent(max_inputs=4)`.
+  One container handles up to 4 actions in parallel; up to 4 containers
+  can run if Bazel fans out widely.
+- **Per-container hardlink pool at `/cas-pool/<hash[:2]>/<hash>`.** Each
+  blob is materialized once on first reference; subsequent actions on the
+  same container hardlink from the pool into per-action workspaces via
+  `os.link` — kernel-level, near-free.
+- Pool inode mode is `0o755` so the executor never has to `chmod` a
+  hardlink (which would alias the inode mode across every path pointing
+  at it).
+
+### Auth
+
+- Every gRPC method is gated by a `_BearerAuthInterceptor` that requires
+  `authorization: Bearer <token>` matching the `rbe-auth-token` Modal
+  Secret. Unauthenticated requests are short-circuited to
+  `UNAUTHENTICATED` before any request bytes are deserialized.
 
 ## Layout
 
@@ -119,30 +143,44 @@ exec_image = (
 modal_rbe/
 ├── app.py            # modal.App, Volume + Dict defs, image definitions
 ├── digest.py         # sha256 + path helpers shared between local and remote
+├── lru.py            # BoundedLruSet / BoundedLruDict (in-process caches)
 ├── cas.py            # Hybrid CAS dispatch (Dict for small, Volume for large)
-├── execute.py        # execute_action Modal Function
-├── server.py         # local_entrypoint that boots the gRPC server
+├── execute.py        # execute_action Modal Function + hardlink pool
+├── server.py         # @app.cls RbeServer + auth interceptor
 ├── resource_name.py  # ByteStream resource-name parser
+├── setup_secret.py   # one-time bootstrap of rbe-auth-token Secret
+├── url.py            # CLI to fetch the deployed tunnel URL
+├── telemetry.py      # per-RPC timing snapshots (printed every 2 s)
 ├── servicers/        # one file per gRPC service
 │   ├── capabilities.py
 │   ├── cas_servicer.py
-│   ├── ac_servicer.py     # AC reads/writes go directly against ac_dict
+│   ├── ac_servicer.py
 │   ├── bytestream.py
 │   └── execution.py
 └── _proto/           # generated, gitignored
 ```
 
-## Limitations (v1)
+## Limitations
 
-- ByteStream uploads are buffered in local memory before being shipped to
-  Modal — capped at `--max-blob-size`.
-- All actions run in one fixed `exec_image`. Per-action `Platform`
-  `container-image` hints are ignored.
-- No partial-upload resume (`QueryWriteStatus` returns `NOT_FOUND`).
-- No support for compressed blobs (`compressed-blobs/...` resource names are
-  rejected).
-- Single instance only — `instance_name` is not validated, treat as
-  single-tenant.
+- **No persistent fast local disk.** Modal doesn't expose per-machine NVMe;
+  the executor's hardlink pool is rebuilt from cold whenever Modal recycles
+  the container. `min_containers=1` keeps recycles infrequent in practice.
+- **Single executor image.** Every action runs in `exec_image`. Per-action
+  `Platform.container-image` hints are ignored.
+- **Wide-fanout builds top out at one container's vCPUs.** With
+  `max_inputs=4` and `max_containers=4`, the executor can chew through 16
+  parallel actions; past that, additional actions queue. Trading
+  `max_containers` higher gives parallel cold pools — a tradeoff between
+  fan-out and warmth.
+- **Pool aliases inode mode.** Non-executable inputs appear with `+x` set
+  because every pool inode is `0o755`. Bazel doesn't typically execute its
+  inputs, so the practical risk is low.
+- **No partial-upload resume.** `QueryWriteStatus` returns `NOT_FOUND`;
+  Bazel restarts the upload.
+- **No compressed blobs.** Resource names with `compressed-blobs/...` are
+  rejected.
+- **Single instance, no auth scoping.** `instance_name` isn't validated;
+  the bearer token is the only access control.
 
 ## Regenerating protos
 
