@@ -1,20 +1,24 @@
 from __future__ import annotations
 
 import logging
+from typing import Mapping
 
 import grpc
+import modal
 from build.bazel.remote.execution.v2 import remote_execution_pb2 as rex
 from build.bazel.remote.execution.v2 import remote_execution_pb2_grpc as rex_grpc
 from google.longrunning import operations_pb2
 from google.protobuf import any_pb2
 from google.rpc import code_pb2, status_pb2
 
-from .. import cas as cas_store
-from .. import execute as exec_mod
-from ..app import ac_dict
-from .ac_servicer import _output_hashes
+from ..cache import CacheStore
+from .ac_servicer import output_hashes
 
 log = logging.getLogger(__name__)
+
+# Bazel-side exec_property name we route on.
+POOL_PROPERTY_KEY = "Pool"
+DEFAULT_POOL = "default"
 
 
 def _pack_response(resp: rex.ExecuteResponse) -> any_pb2.Any:
@@ -30,49 +34,60 @@ def _pack_metadata(stage: int, action_digest: rex.Digest) -> any_pb2.Any:
     return a
 
 
-async def _try_cached_result(action_digest: rex.Digest) -> rex.ActionResult | None:
-    blob = await ac_dict.get.aio(action_digest.hash, None)
-    if blob is None:
-        return None
-    result = rex.ActionResult()
-    result.ParseFromString(blob)
-    hashes = _output_hashes(result)
-    if hashes:
-        missing = await cas_store.find_missing(hashes)
-        if missing:
-            return None
-    return result
-
-
-async def _select_executor(action_digest: rex.Digest):
-    """Pick a per-pool Modal Function based on the action's `Pool`
-    exec_property (Action.platform.properties). Falls back to the default
-    pool if the property is absent or names an unknown pool."""
-    blob = await cas_store.read(action_digest.hash)
-    if blob is None:
-        return exec_mod.execute_default
-    action = rex.Action()
-    action.ParseFromString(blob)
-    for prop in action.platform.properties:
-        if prop.name == exec_mod.POOL_PROPERTY_KEY:
-            fn = exec_mod.EXECUTORS_BY_POOL.get(prop.value)
-            if fn is not None:
-                return fn
-            log.warning(
-                "action %s requested unknown pool %r; routing to %s",
-                action_digest.hash, prop.value, exec_mod.DEFAULT_POOL,
-            )
-            break
-    return exec_mod.execute_default
-
-
 class ExecutionServicer(rex_grpc.ExecutionServicer):
+    def __init__(
+        self,
+        cache: CacheStore,
+        pools: Mapping[str, "modal.Function"],
+        default_pool: str = DEFAULT_POOL,
+    ) -> None:
+        if default_pool not in pools:
+            raise ValueError(
+                f"default_pool {default_pool!r} not in pools {list(pools)}"
+            )
+        self._cache = cache
+        self._pools = dict(pools)
+        self._default_pool = default_pool
+
+    async def _try_cached_result(
+        self, action_digest: rex.Digest
+    ) -> rex.ActionResult | None:
+        blob = await self._cache.get_action_result(action_digest.hash)
+        if blob is None:
+            return None
+        result = rex.ActionResult()
+        result.ParseFromString(blob)
+        hashes = output_hashes(result)
+        if hashes:
+            missing = await self._cache.find_missing(hashes)
+            if missing:
+                return None
+        return result
+
+    async def _select_executor(self, action_digest: rex.Digest):
+        blob = await self._cache.read(action_digest.hash)
+        if blob is None:
+            return self._pools[self._default_pool]
+        action = rex.Action()
+        action.ParseFromString(blob)
+        for prop in action.platform.properties:
+            if prop.name == POOL_PROPERTY_KEY:
+                fn = self._pools.get(prop.value)
+                if fn is not None:
+                    return fn
+                log.warning(
+                    "action %s requested unknown pool %r; routing to %s",
+                    action_digest.hash, prop.value, self._default_pool,
+                )
+                break
+        return self._pools[self._default_pool]
+
     async def Execute(self, request, context):  # noqa: N802
         action_digest = request.action_digest
         op_name = f"actions/{action_digest.hash}/{action_digest.size_bytes}"
 
         if not request.skip_cache_lookup:
-            cached = await _try_cached_result(action_digest)
+            cached = await self._try_cached_result(action_digest)
             if cached is not None:
                 resp = rex.ExecuteResponse(
                     result=cached,
@@ -89,7 +104,7 @@ class ExecutionServicer(rex_grpc.ExecutionServicer):
                 )
                 return
 
-        executor = await _select_executor(action_digest)
+        executor = await self._select_executor(action_digest)
         try:
             resp_bytes = await executor.remote.aio(
                 action_digest.hash, action_digest.size_bytes

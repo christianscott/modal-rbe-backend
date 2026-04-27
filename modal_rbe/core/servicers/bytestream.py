@@ -6,18 +6,18 @@ import grpc
 from google.bytestream import bytestream_pb2 as bs
 from google.bytestream import bytestream_pb2_grpc as bs_grpc
 
-from .. import cas as cas_store
+from ..cache import CacheStore
 from ..resource_name import parse_read_resource, parse_write_resource
 from ..telemetry import timed
 
 log = logging.getLogger(__name__)
 
-# Chunk size when streaming reads back to Bazel.
 _READ_CHUNK = 64 * 1024
 
 
 class ByteStreamServicer(bs_grpc.ByteStreamServicer):
-    def __init__(self, max_blob_size: int) -> None:
+    def __init__(self, cache: CacheStore, max_blob_size: int) -> None:
+        self._cache = cache
         self._max_blob_size = max_blob_size
 
     async def Read(self, request, context):  # noqa: N802
@@ -27,7 +27,7 @@ class ByteStreamServicer(bs_grpc.ByteStreamServicer):
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
             return
         with timed("ByteStream.Read"):
-            blob = await cas_store.read(res.hash)
+            blob = await self._cache.read(res.hash)
         if blob is None:
             await context.abort(
                 grpc.StatusCode.NOT_FOUND, f"blob {res.hash} not in CAS"
@@ -107,7 +107,7 @@ class ByteStreamServicer(bs_grpc.ByteStreamServicer):
             )
             return
         try:
-            await cas_store.write(res.hash, res.size, bytes(buf))
+            await self._cache.write(res.hash, res.size, bytes(buf))
         except Exception as e:  # noqa: BLE001
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
             return
