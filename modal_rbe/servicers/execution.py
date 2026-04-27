@@ -44,6 +44,28 @@ async def _try_cached_result(action_digest: rex.Digest) -> rex.ActionResult | No
     return result
 
 
+async def _select_executor(action_digest: rex.Digest):
+    """Pick a per-pool Modal Function based on the action's `Pool`
+    exec_property (Action.platform.properties). Falls back to the default
+    pool if the property is absent or names an unknown pool."""
+    blob = await cas_store.read(action_digest.hash)
+    if blob is None:
+        return exec_mod.execute_default
+    action = rex.Action()
+    action.ParseFromString(blob)
+    for prop in action.platform.properties:
+        if prop.name == exec_mod.POOL_PROPERTY_KEY:
+            fn = exec_mod.EXECUTORS_BY_POOL.get(prop.value)
+            if fn is not None:
+                return fn
+            log.warning(
+                "action %s requested unknown pool %r; routing to %s",
+                action_digest.hash, prop.value, exec_mod.DEFAULT_POOL,
+            )
+            break
+    return exec_mod.execute_default
+
+
 class ExecutionServicer(rex_grpc.ExecutionServicer):
     async def Execute(self, request, context):  # noqa: N802
         action_digest = request.action_digest
@@ -67,8 +89,9 @@ class ExecutionServicer(rex_grpc.ExecutionServicer):
                 )
                 return
 
+        executor = await _select_executor(action_digest)
         try:
-            resp_bytes = await exec_mod.execute_action.remote.aio(
+            resp_bytes = await executor.remote.aio(
                 action_digest.hash, action_digest.size_bytes
             )
         except Exception as e:  # noqa: BLE001

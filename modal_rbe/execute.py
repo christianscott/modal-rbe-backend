@@ -9,7 +9,15 @@ import threading
 
 import modal
 
-from .app import CAS_MOUNT, ac_dict, app, cas_dict, cas_volume, exec_image
+from .app import (
+    CAS_MOUNT,
+    ac_dict,
+    app,
+    cas_dict,
+    cas_volume,
+    default_exec_image,
+    light_exec_image,
+)
 from .cas import SMALL_THRESHOLD, _INLINE, _VOLUME_MARKER
 from .digest import cas_path, ensure_parent
 
@@ -196,17 +204,32 @@ _EXEC_INPUT_CONCURRENCY = 4
 # `ephemeral_disk` by default (and that's also the minimum — Modal won't
 # accept a request smaller). The hardlink pool below lives on this scratch.
 
+# ---------------------------------------------------------------------------
+# Pool routing
+#
+# An "action pool" is a logical execution environment — one Modal Function
+# with one Image and its own warm container + hardlink pool. Bazel chooses
+# which pool an action goes to via an exec_property:
+#
+#     exec_properties = {"Pool": "light"}     # per-target
+#     --remote_default_exec_properties=Pool=light    # workspace default
+#
+# Actions without a `Pool` property (or with an unknown one) fall through to
+# the `default` pool. To add a pool: declare an Image in app.py, register it
+# in EXECUTORS_BY_POOL below.
+# ---------------------------------------------------------------------------
 
-@app.function(
-    image=exec_image,
-    volumes={CAS_MOUNT: cas_volume},
-    timeout=EXEC_FUNCTION_TIMEOUT,
-    min_containers=1,
-    max_containers=_EXEC_MAX_CONTAINERS,
-)
-@modal.concurrent(max_inputs=_EXEC_INPUT_CONCURRENCY)
-def execute_action(action_hash: str, action_size: int) -> bytes:
-    """Run an action and return a serialized ExecuteResponse."""
+POOL_PROPERTY_KEY = "Pool"
+DEFAULT_POOL = "default"
+
+
+def _execute_impl(action_hash: str, action_size: int) -> bytes:
+    """Action-execution body, shared by every per-pool wrapper.
+
+    Each wrapper's only job is to bind a specific Modal Image and image-level
+    Function options (min_containers, etc.); all the materialize / subprocess /
+    collect / cache logic lives here.
+    """
     from build.bazel.remote.execution.v2 import remote_execution_pb2 as rex
     from google.rpc import code_pb2, status_pb2
 
@@ -328,3 +351,49 @@ def execute_action(action_hash: str, action_size: int) -> bytes:
             status=status_pb2.Status(code=code_pb2.OK),
         )
         return response.SerializeToString()
+
+
+# ---------------------------------------------------------------------------
+# Per-pool Modal Functions
+#
+# Each one is a thin wrapper around `_execute_impl`; the only thing that
+# differs is the Image (and per-pool Function options like min_containers).
+# Modal binds an Image at decoration time, so we can't pass the image
+# through as a parameter — hence one decorated function per pool.
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    image=default_exec_image,
+    volumes={CAS_MOUNT: cas_volume},
+    timeout=EXEC_FUNCTION_TIMEOUT,
+    min_containers=1,
+    max_containers=_EXEC_MAX_CONTAINERS,
+)
+@modal.concurrent(max_inputs=_EXEC_INPUT_CONCURRENCY)
+def execute_default(action_hash: str, action_size: int) -> bytes:
+    """Default executor pool — debian_slim + build-essential + git + python3."""
+    return _execute_impl(action_hash, action_size)
+
+
+@app.function(
+    image=light_exec_image,
+    volumes={CAS_MOUNT: cas_volume},
+    timeout=EXEC_FUNCTION_TIMEOUT,
+    # min_containers=0 (default): scale to zero when no `Pool=light` traffic;
+    # actions targeting this pool pay a cold-start tax on first request.
+    max_containers=_EXEC_MAX_CONTAINERS,
+)
+@modal.concurrent(max_inputs=_EXEC_INPUT_CONCURRENCY)
+def execute_light(action_hash: str, action_size: int) -> bytes:
+    """Light pool — debian_slim with no apt packages. For actions whose
+    command only needs a shell + python interpreter."""
+    return _execute_impl(action_hash, action_size)
+
+
+# Registered pools. Add new pools by declaring an Image in app.py, defining
+# a wrapper Function above, and adding it here.
+EXECUTORS_BY_POOL: dict[str, "modal.Function"] = {
+    "default": execute_default,
+    "light": execute_light,
+}

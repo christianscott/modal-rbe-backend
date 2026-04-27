@@ -117,18 +117,40 @@ Incremental Go compile on `examples/exec-go` (1 source file changed,
 
 ### Execution plane
 
-- `execute_action` runs in a separate `@app.function` with `exec_image`
-  mounted with `cas_volume`.
-- `min_containers=1`, `max_containers=4`, `@modal.concurrent(max_inputs=4)`.
-  One container handles up to 4 actions in parallel; up to 4 containers
-  can run if Bazel fans out widely.
+- One Modal Function per **action pool**. A pool = an Image plus per-pool
+  Function options (e.g. `min_containers`). The default pool is
+  `debian_slim + build-essential + git + python3` and is always warm
+  (`min_containers=1`); the `light` pool is bare `debian_slim` and scales
+  to zero. Add a pool by declaring an Image in `app.py`, registering a
+  thin wrapper Function in `execute.py`, and adding it to
+  `EXECUTORS_BY_POOL`.
+- Bazel chooses the pool via the `Pool` exec_property:
+
+  ```
+  # workspace-wide
+  build --remote_default_exec_properties=Pool=light
+
+  # per-target
+  cc_binary(
+      name = "fast",
+      srcs = ["main.c"],
+      exec_properties = {"Pool": "light"},
+  )
+  ```
+
+  Actions without a `Pool` property (or with an unknown pool name) route
+  to `default` and the unknown-pool case is logged.
+- `max_containers=4`, `@modal.concurrent(max_inputs=4)` per pool. One
+  container handles up to 4 actions in parallel; up to 4 containers can
+  run if Bazel fans out widely (so 16 in-flight per pool).
 - Modal gives every container **512 GiB of SSD-backed scratch by default**
   (`ephemeral_disk`); the hardlink pool lives on it. 512 GiB is also
   Modal's *minimum* — you can't request smaller.
 - **Per-container hardlink pool at `/cas-pool/<hash[:2]>/<hash>`.** Each
   blob is materialized once on first reference; subsequent actions on the
   same container hardlink from the pool into per-action workspaces via
-  `os.link` — kernel-level, near-free.
+  `os.link` — kernel-level, near-free. Each action pool has its own
+  hardlink pool; no cross-pool sharing.
 - Pool inode mode is `0o755` so the executor never has to `chmod` a
   hardlink (which would alias the inode mode across every path pointing
   at it).
@@ -171,8 +193,10 @@ modal_rbe/
   container. `min_containers=1` keeps recycles infrequent in practice.
   Modal doesn't expose anything that survives recycle (e.g. an attached
   NVMe scoped to the worker).
-- **Single executor image.** Every action runs in `exec_image`. Per-action
-  `Platform.container-image` hints are ignored.
+- **Pre-defined executor pools.** Each pool is one Image bound at deploy
+  time; arbitrary registry images requested via Bazel's `container-image`
+  exec_property are not honored. Adding a pool requires a code change +
+  redeploy. See "Execution plane" above.
 - **Wide-fanout builds top out at one container's vCPUs.** With
   `max_inputs=4` and `max_containers=4`, the executor can chew through 16
   parallel actions; past that, additional actions queue. Trading
