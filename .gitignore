@@ -17,3 +17,6 @@ examples/bazel-remote/
 
 # bazel artefacts in example workspaces
 bazel-*
+
+# per-workspace local overrides (endpoint URL, auth token)
+.bazelrc.local

@@ -1,0 +1,15 @@
+common --enable_bzlmod
+
+# Build for linux_amd64; combined with --extra_execution_platforms below, this
+# forces every Go compile/link action onto the Modal executor (the local
+# darwin host can't execute linux toolchain binaries).
+build --platforms=//:linux_amd64
+build --extra_execution_platforms=//:linux_amd64
+
+build --remote_instance_name=default
+build --remote_timeout=300
+build --verbose_failures
+
+# Endpoint + token are dynamic per deploy; copy `.bazelrc.local.example` to
+# `.bazelrc.local` and fill in current values.
+try-import %workspace%/.bazelrc.local

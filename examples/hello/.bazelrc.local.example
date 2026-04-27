@@ -1,0 +1,7 @@
+# Copy to .bazelrc.local and fill in:
+#   uv run python -m modal_rbe.url               # for <URL>
+#   modal secret list / dashboard                # for <TOKEN>
+
+build --remote_cache=grpcs://<URL>.w.modal.host
+build --remote_executor=grpcs://<URL>.w.modal.host
+build --remote_header=authorization="Bearer <TOKEN>"
