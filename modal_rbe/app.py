@@ -27,10 +27,10 @@ cache_image = (
     .add_local_python_source("modal_rbe")
 )
 
-# Image used by the executor. Tune this to match your toolchain — it must
-# contain every binary your Bazel actions invoke. The defaults below cover a
-# typical C/C++/Python build.
-exec_image = (
+# Default executor image — covers a typical C/C++/Python build. Bazel
+# actions land here unless the action's Platform proto specifies a different
+# `Pool` exec_property (see modal_rbe/execute.py).
+default_exec_image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install(
         "build-essential",
@@ -43,3 +43,16 @@ exec_image = (
     .pip_install("protobuf>=4.25", "grpcio>=1.60")
     .add_local_python_source("modal_rbe")
 )
+
+# A trimmed-down executor image with no apt packages — for actions that only
+# need the standard interpreter / shell. Demonstrates pool routing; pick
+# `Pool=light` from Bazel via exec_properties to land here.
+light_exec_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install("protobuf>=4.25", "grpcio>=1.60")
+    .add_local_python_source("modal_rbe")
+)
+
+# Backwards-compatible alias; `exec_image` may still be imported by
+# downstream code.
+exec_image = default_exec_image
